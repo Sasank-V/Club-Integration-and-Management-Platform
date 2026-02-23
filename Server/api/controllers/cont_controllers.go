@@ -114,8 +114,146 @@ func GetContributionByID(id string) (types.FullContribution, error) {
 	}, nil
 }
 
+// GetContributionsByIDs fetches multiple contributions with their related data in batch
+func GetContributionsByIDs(ids []string) ([]types.FullContribution, error) {
+	if len(ids) == 0 {
+		return []types.FullContribution{}, nil
+	}
+
+	ctx, cancel := database.GetLongContext()
+	defer cancel()
+
+	// Fetch all contributions
+	filter := bson.M{"id": bson.M{"$in": ids}}
+	cursor, err := ContColl.Find(ctx, filter)
+	if err != nil {
+		log.Printf("error fetching contributions in batch: %v", err)
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var contributions []schemas.Contribution
+	if err = cursor.All(ctx, &contributions); err != nil {
+		log.Printf("cursor error in GetContributionsByIDs: %v", err)
+		return nil, err
+	}
+
+	if len(contributions) == 0 {
+		return []types.FullContribution{}, nil
+	}
+
+	// Collect all unique IDs for batch fetching
+	clubIDs := make(map[string]bool)
+	deptIDs := make(map[string]bool)
+	userIDs := make(map[string]bool)
+
+	for _, cont := range contributions {
+		clubIDs[cont.ClubID] = true
+		deptIDs[cont.Department] = true
+		userIDs[cont.UserID] = true
+		userIDs[cont.Target] = true
+		for _, secTarget := range cont.SecTargets {
+			userIDs[secTarget] = true
+		}
+	}
+
+	// Convert map keys to slices
+	clubIDList := make([]string, 0, len(clubIDs))
+	for id := range clubIDs {
+		clubIDList = append(clubIDList, id)
+	}
+
+	deptIDList := make([]string, 0, len(deptIDs))
+	for id := range deptIDs {
+		deptIDList = append(deptIDList, id)
+	}
+
+	userIDList := make([]string, 0, len(userIDs))
+	for id := range userIDs {
+		userIDList = append(userIDList, id)
+	}
+
+	// Batch fetch all entities in parallel
+	var wg sync.WaitGroup
+	var clubMap map[string]schemas.Club
+	var deptMap map[string]schemas.Department
+	var userMap map[string]schemas.User
+	var clubErr, deptErr, userErr error
+
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		clubMap, clubErr = GetClubsByIDs(clubIDList)
+	}()
+
+	go func() {
+		defer wg.Done()
+		deptMap, deptErr = GetDepartmentsByIDs(deptIDList)
+	}()
+
+	go func() {
+		defer wg.Done()
+		userMap, userErr = GetUsersByIDs(userIDList)
+	}()
+
+	wg.Wait()
+
+	// Check for errors
+	if clubErr != nil {
+		log.Printf("error fetching clubs in batch: %v", clubErr)
+		return nil, clubErr
+	}
+	if deptErr != nil {
+		log.Printf("error fetching departments in batch: %v", deptErr)
+		return nil, deptErr
+	}
+	if userErr != nil {
+		log.Printf("error fetching users in batch: %v", userErr)
+		return nil, userErr
+	}
+
+	// Build the results
+	results := make([]types.FullContribution, 0, len(contributions))
+	for _, cont := range contributions {
+		club, clubOk := clubMap[cont.ClubID]
+		dept, deptOk := deptMap[cont.Department]
+		user, userOk := userMap[cont.UserID]
+
+		if !clubOk || !deptOk || !userOk {
+			log.Printf("missing data for contribution %s: club=%v, dept=%v, user=%v",
+				cont.ID, clubOk, deptOk, userOk)
+			continue
+		}
+
+		// Collect all lead user IDs
+		leadUserIDs := []string{cont.Target}
+		leadUserIDs = append(leadUserIDs, cont.SecTargets...)
+
+		// Build lead user names array
+		leadUserNames := make([]string, 0, len(leadUserIDs))
+		for _, leadUserID := range leadUserIDs {
+			if leadUser, ok := userMap[leadUserID]; ok {
+				leadUserNames = append(leadUserNames, leadUser.FirstName+" "+leadUser.LastName)
+			} else {
+				log.Printf("missing lead user %s for contribution %s", leadUserID, cont.ID)
+				leadUserNames = append(leadUserNames, "Unknown User")
+			}
+		}
+
+		results = append(results, types.FullContribution{
+			Contribution:   cont,
+			ClubName:       club.Name,
+			DepartmentName: dept.Name,
+			UserName:       user.FirstName + " " + user.LastName,
+			LeadUserNames:  leadUserNames,
+		})
+	}
+
+	return results, nil
+}
+
 func GetContributionsWithTarget(id string) ([]types.FullContribution, error) {
-	ctx, cancel := database.GetContext()
+	ctx, cancel := database.GetLongContext()
 	defer cancel()
 
 	filter := bson.M{
@@ -135,112 +273,124 @@ func GetContributionsWithTarget(id string) ([]types.FullContribution, error) {
 	}
 	defer cursor.Close(ctx)
 
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var requests []types.FullContribution
-	var firstErr error
-
-	for cursor.Next(ctx) {
-		var cont schemas.Contribution
-		if err := cursor.Decode(&cont); err != nil {
-			return []types.FullContribution{}, err
-		}
-
-		wg.Add(1)
-		go func(cont schemas.Contribution) {
-			defer wg.Done()
-
-			// Collect all lead user IDs (target + secTargets)
-			leadUserIDs := []string{cont.Target}
-			leadUserIDs = append(leadUserIDs, cont.SecTargets...)
-
-			var wg1 sync.WaitGroup
-			wg1.Add(3 + len(leadUserIDs)) // club, dept, user + all lead users
-
-			var club schemas.Club
-			var dept schemas.Department
-			var user schemas.User
-			var clubErr, deptErr, userErr error
-
-			// Fetch club, department, and submitted user
-			go func(clubID string) {
-				defer wg1.Done()
-				club, clubErr = GetClubByID(clubID)
-			}(cont.ClubID)
-
-			go func(deptID string) {
-				defer wg1.Done()
-				dept, deptErr = GetDepartmentByID(deptID)
-			}(cont.Department)
-
-			go func(userID string) {
-				defer wg1.Done()
-				user, userErr = GetUserByID(userID)
-			}(cont.UserID)
-
-			// Fetch all lead users
-			leadUsers := make([]schemas.User, len(leadUserIDs))
-			leadUserErrors := make([]error, len(leadUserIDs))
-
-			for i, leadUserID := range leadUserIDs {
-				go func(index int, userID string) {
-					defer wg1.Done()
-					leadUsers[index], leadUserErrors[index] = GetUserByID(userID)
-				}(i, leadUserID)
-			}
-
-			wg1.Wait()
-
-			if clubErr != nil || deptErr != nil || userErr != nil {
-				mu.Lock()
-				if firstErr == nil {
-					if clubErr != nil {
-						firstErr = clubErr
-					} else if deptErr != nil {
-						firstErr = deptErr
-					} else {
-						firstErr = userErr
-					}
-				}
-				mu.Unlock()
-				return
-			}
-
-			// Check for lead user errors
-			for _, leadErr := range leadUserErrors {
-				if leadErr != nil {
-					mu.Lock()
-					if firstErr == nil {
-						firstErr = leadErr
-					}
-					mu.Unlock()
-					return
-				}
-			}
-
-			// Build lead user names array
-			leadUserNames := make([]string, len(leadUsers))
-			for i, leadUser := range leadUsers {
-				leadUserNames[i] = leadUser.FirstName + " " + leadUser.LastName
-			}
-
-			mu.Lock()
-			requests = append(requests, types.FullContribution{
-				Contribution:   cont,
-				ClubName:       club.Name,
-				DepartmentName: dept.Name,
-				UserName:       user.FirstName + " " + user.LastName,
-				LeadUserNames:  leadUserNames,
-			})
-			mu.Unlock()
-		}(cont)
+	// First, collect all contributions
+	var contributions []schemas.Contribution
+	if err = cursor.All(ctx, &contributions); err != nil {
+		log.Printf("error decoding contributions: %v", err)
+		return []types.FullContribution{}, err
 	}
+
+	if len(contributions) == 0 {
+		return []types.FullContribution{}, nil
+	}
+
+	// Collect all unique IDs for batch fetching
+	clubIDs := make(map[string]bool)
+	deptIDs := make(map[string]bool)
+	userIDs := make(map[string]bool)
+
+	for _, cont := range contributions {
+		clubIDs[cont.ClubID] = true
+		deptIDs[cont.Department] = true
+		userIDs[cont.UserID] = true
+		userIDs[cont.Target] = true
+		for _, secTarget := range cont.SecTargets {
+			userIDs[secTarget] = true
+		}
+	}
+
+	// Convert map keys to slices
+	clubIDList := make([]string, 0, len(clubIDs))
+	for id := range clubIDs {
+		clubIDList = append(clubIDList, id)
+	}
+
+	deptIDList := make([]string, 0, len(deptIDs))
+	for id := range deptIDs {
+		deptIDList = append(deptIDList, id)
+	}
+
+	userIDList := make([]string, 0, len(userIDs))
+	for id := range userIDs {
+		userIDList = append(userIDList, id)
+	}
+
+	// Batch fetch all entities in parallel
+	var wg sync.WaitGroup
+	var clubMap map[string]schemas.Club
+	var deptMap map[string]schemas.Department
+	var userMap map[string]schemas.User
+	var clubErr, deptErr, userErr error
+
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		clubMap, clubErr = GetClubsByIDs(clubIDList)
+	}()
+
+	go func() {
+		defer wg.Done()
+		deptMap, deptErr = GetDepartmentsByIDs(deptIDList)
+	}()
+
+	go func() {
+		defer wg.Done()
+		userMap, userErr = GetUsersByIDs(userIDList)
+	}()
 
 	wg.Wait()
-	if firstErr != nil {
-		log.Printf("Error fetching contributions with target: %v", firstErr)
-		return []types.FullContribution{}, fmt.Errorf("error fetching contributions with targets: %w", firstErr)
+
+	// Check for errors
+	if clubErr != nil {
+		log.Printf("error fetching clubs in batch: %v", clubErr)
+		return []types.FullContribution{}, clubErr
 	}
+	if deptErr != nil {
+		log.Printf("error fetching departments in batch: %v", deptErr)
+		return []types.FullContribution{}, deptErr
+	}
+	if userErr != nil {
+		log.Printf("error fetching users in batch: %v", userErr)
+		return []types.FullContribution{}, userErr
+	}
+
+	// Build the results using the fetched data
+	requests := make([]types.FullContribution, 0, len(contributions))
+	for _, cont := range contributions {
+		club, clubOk := clubMap[cont.ClubID]
+		dept, deptOk := deptMap[cont.Department]
+		user, userOk := userMap[cont.UserID]
+
+		if !clubOk || !deptOk || !userOk {
+			log.Printf("missing data for contribution %s: club=%v, dept=%v, user=%v", 
+				cont.ID, clubOk, deptOk, userOk)
+			continue
+		}
+
+		// Collect all lead user IDs
+		leadUserIDs := []string{cont.Target}
+		leadUserIDs = append(leadUserIDs, cont.SecTargets...)
+
+		// Build lead user names array
+		leadUserNames := make([]string, 0, len(leadUserIDs))
+		for _, leadUserID := range leadUserIDs {
+			if leadUser, ok := userMap[leadUserID]; ok {
+				leadUserNames = append(leadUserNames, leadUser.FirstName+" "+leadUser.LastName)
+			} else {
+				log.Printf("missing lead user %s for contribution %s", leadUserID, cont.ID)
+				leadUserNames = append(leadUserNames, "Unknown User")
+			}
+		}
+
+		requests = append(requests, types.FullContribution{
+			Contribution:   cont,
+			ClubName:       club.Name,
+			DepartmentName: dept.Name,
+			UserName:       user.FirstName + " " + user.LastName,
+			LeadUserNames:  leadUserNames,
+		})
+	}
+
 	return requests, nil
 }
 

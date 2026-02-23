@@ -37,3 +37,35 @@ func GetClubByID(id string) (schemas.Club, error) {
 	}
 	return club, nil
 }
+
+// GetClubsByIDs fetches multiple clubs in a single batch query
+func GetClubsByIDs(ids []string) (map[string]schemas.Club, error) {
+	if len(ids) == 0 {
+		return make(map[string]schemas.Club), nil
+	}
+
+	ctx, cancel := database.GetLongContext()
+	defer cancel()
+
+	filter := bson.M{"id": bson.M{"$in": ids}}
+	cursor, err := ClubColl.Find(ctx, filter)
+	if err != nil {
+		log.Printf("error fetching clubs in batch: %v", err)
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var clubs []schemas.Club
+	if err = cursor.All(ctx, &clubs); err != nil {
+		log.Printf("cursor error in GetClubsByIDs: %v", err)
+		return nil, err
+	}
+
+	// Create a map for quick lookup
+	clubMap := make(map[string]schemas.Club, len(clubs))
+	for _, club := range clubs {
+		clubMap[club.ID] = club
+	}
+
+	return clubMap, nil
+}

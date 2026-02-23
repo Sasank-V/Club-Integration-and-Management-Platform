@@ -34,15 +34,24 @@ func connectDB() *mongo.Client {
 		if uri == "" {
 			log.Fatal("Set your 'CONNECTION_STRING' environment variable. ")
 		}
-		dbClient, err := mongo.Connect(options.Client().
-			ApplyURI(uri))
+		
+		// Configure connection pool settings to handle high loads
+		clientOpts := options.Client().
+			ApplyURI(uri).
+			SetMaxPoolSize(200).        // Increased from default 100
+			SetMinPoolSize(10).         // Maintain minimum idle connections
+			SetMaxConnecting(50).       // Allow more concurrent connection establishments
+			SetMaxConnIdleTime(30 * time.Second). // Close idle connections after 30s
+			SetTimeout(10 * time.Second) // Connection timeout
+		
+		dbClient, err := mongo.Connect(clientOpts)
 		if err != nil {
 			log.Fatal("[MONGO-DB] Failed to connect to MongoDB: ", err)
 		}
 		if err := dbClient.Ping(context.TODO(), nil); err != nil {
 			log.Fatal("[MONGO-DB] MongoDB connection test failed: ", err)
 		}
-		fmt.Printf("[MONGO-DB] MongoDB Connected\n")
+		fmt.Printf("[MONGO-DB] MongoDB Connected (MaxPool: 200, MinPool: 10)\n")
 		DBClient = dbClient
 	})
 	return DBClient
@@ -66,7 +75,12 @@ func SetUniqueKeys(coll *mongo.Collection, uniqueFields []string) error {
 }
 
 func GetContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), 5*time.Second)
+	return context.WithTimeout(context.Background(), 10*time.Second)
+}
+
+// GetLongContext returns a context with extended timeout for bulk operations
+func GetLongContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 30*time.Second)
 }
 
 func CollectionExists(db *mongo.Database, collName string) (bool, error) {

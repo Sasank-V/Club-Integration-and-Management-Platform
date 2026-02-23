@@ -55,6 +55,38 @@ func GetUserByID(id string) (schemas.User, error) {
 	return user, nil
 }
 
+// GetUsersByIDs fetches multiple users in a single batch query
+func GetUsersByIDs(ids []string) (map[string]schemas.User, error) {
+	if len(ids) == 0 {
+		return make(map[string]schemas.User), nil
+	}
+
+	ctx, cancel := database.GetLongContext()
+	defer cancel()
+
+	filter := bson.M{"id": bson.M{"$in": ids}}
+	cursor, err := UserColl.Find(ctx, filter)
+	if err != nil {
+		log.Printf("error fetching users in batch: %v", err)
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var users []schemas.User
+	if err = cursor.All(ctx, &users); err != nil {
+		log.Printf("cursor error in GetUsersByIDs: %v", err)
+		return nil, err
+	}
+
+	// Create a map for quick lookup
+	userMap := make(map[string]schemas.User, len(users))
+	for _, user := range users {
+		userMap[user.ID] = user
+	}
+
+	return userMap, nil
+}
+
 func GetAllUserInClub(id string) ([]schemas.User, error) {
 	ctx, cancel := database.GetContext()
 	defer cancel()
@@ -84,35 +116,14 @@ func GetAllUserContributions(id string) ([]types.FullContribution, error) {
 		return []types.FullContribution{}, err
 	}
 
-	contChan := make(chan types.FullContribution, len(user.Contributions))
-	errChan := make(chan error, len(user.Contributions))
-	var wg sync.WaitGroup
-
-	for _, contID := range user.Contributions {
-		wg.Add(1)
-		go func(id string) {
-			defer wg.Done()
-			fullCont, err := GetContributionByID(id)
-			if err != nil {
-				errChan <- err
-				return
-			}
-			contChan <- fullCont
-		}(contID)
+	if len(user.Contributions) == 0 {
+		return []types.FullContribution{}, nil
 	}
 
-	wg.Wait()
-	close(contChan)
-	close(errChan)
-
-	var contributions []types.FullContribution
-	for cont := range contChan {
-		contributions = append(contributions, cont)
-	}
-
-	if len(errChan) > 0 {
-		err = <-errChan
-		log.Printf("Error fetching Contribution :", err)
+	// Use batch fetching for better performance
+	contributions, err := GetContributionsByIDs(user.Contributions)
+	if err != nil {
+		log.Printf("Error fetching contributions: %v", err)
 		return []types.FullContribution{}, err
 	}
 

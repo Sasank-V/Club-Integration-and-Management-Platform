@@ -36,6 +36,38 @@ func GetDepartmentByID(id string) (schemas.Department, error) {
 	return dept, nil
 }
 
+// GetDepartmentsByIDs fetches multiple departments in a single batch query
+func GetDepartmentsByIDs(ids []string) (map[string]schemas.Department, error) {
+	if len(ids) == 0 {
+		return make(map[string]schemas.Department), nil
+	}
+
+	ctx, cancel := database.GetLongContext()
+	defer cancel()
+
+	filter := bson.M{"id": bson.M{"$in": ids}}
+	cursor, err := DeptColl.Find(ctx, filter)
+	if err != nil {
+		log.Printf("error fetching departments in batch: %v", err)
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var depts []schemas.Department
+	if err = cursor.All(ctx, &depts); err != nil {
+		log.Printf("cursor error in GetDepartmentsByIDs: %v", err)
+		return nil, err
+	}
+
+	// Create a map for quick lookup
+	deptMap := make(map[string]schemas.Department, len(depts))
+	for _, dept := range depts {
+		deptMap[dept.ID] = dept
+	}
+
+	return deptMap, nil
+}
+
 func GetAllDepartmentsInClub(id string) ([]schemas.Department, error) {
 	ctx, cancel := database.GetContext()
 	defer cancel()
@@ -65,12 +97,8 @@ func GetDepartmentLeadsByID(id string) ([]types.LeadsInfo, error) {
 		return []types.LeadsInfo{}, err
 	}
 
-	// If no leads, return empty array
-	if len(dept.Leads) == 0 {
-		return []types.LeadsInfo{}, nil
-	}
-	var leadChan = make(chan types.LeadsInfo, len(dept.Leads))
-	var errChan = make(chan error, len(dept.Leads))
+	var leadChan = make(chan types.LeadsInfo)
+	var errChan = make(chan error)
 	var wg sync.WaitGroup
 
 	for _, leadUserID := range dept.Leads {
@@ -98,13 +126,9 @@ func GetDepartmentLeadsByID(id string) ([]types.LeadsInfo, error) {
 		leadsData = append(leadsData, lead)
 	}
 
-	// Check for errors after collecting successful results
 	if len(errChan) > 0 {
 		err := <-errChan
 		log.Printf("error fetching lead user data: %v", err)
-		if len(leadsData) > 0 {
-			return leadsData, nil
-		}
 		return []types.LeadsInfo{}, err
 	}
 	return leadsData, nil
